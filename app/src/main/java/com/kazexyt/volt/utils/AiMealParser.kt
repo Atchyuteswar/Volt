@@ -8,6 +8,8 @@ import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.contentType
 import kotlinx.serialization.json.*
+import java.util.UUID
+import java.time.OffsetDateTime
 
 object AiMealParser {
 
@@ -16,48 +18,80 @@ object AiMealParser {
         isLenient = true
     }
 
-    // 📍 Notice: Returns MealLog directly, not MealLog?
     suspend fun parseSpokenMeal(spokenText: String): MealLog {
-        return callParseMeal(mapOf("spokenText" to spokenText))
+        // Use "parse-meal" for voice/text logs
+        return callParseMeal("parse-meal", mapOf("spokenText" to spokenText))
     }
 
     suspend fun parseImage(imageFile: java.io.File): MealLog {
-        val bytes = imageFile.readBytes()
-        val base64Image = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
-        return callParseMeal(mapOf(
-            "image" to base64Image,
-            "spokenText" to "Image-based parsing request"
+        // 1. Process and resize the image for the AI lens
+        val options = android.graphics.BitmapFactory.Options().apply {
+            inJustDecodeBounds = true
+        }
+        android.graphics.BitmapFactory.decodeFile(imageFile.absolutePath, options)
+
+        var inSampleSize = 1
+        val maxDim = 1024
+        if (options.outHeight > maxDim || options.outWidth > maxDim) {
+            val halfHeight = options.outHeight / 2
+            val halfWidth = options.outWidth / 2
+            while (halfHeight / inSampleSize >= maxDim && halfWidth / inSampleSize >= maxDim) {
+                inSampleSize *= 2
+            }
+        }
+
+        val decodeOptions = android.graphics.BitmapFactory.Options().apply {
+            this.inSampleSize = inSampleSize
+        }
+        val bitmap = android.graphics.BitmapFactory.decodeFile(imageFile.absolutePath, decodeOptions)
+            ?: throw Exception("Could not process the captured image.")
+
+        // 2. Compress to JPEG
+        val out = java.io.ByteArrayOutputStream()
+        bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 80, out)
+        val compressedBytes = out.toByteArray()
+
+        // 3. Encode to raw Base64 (Standard for gemini-vision endpoint)
+        val base64Image = android.util.Base64.encodeToString(compressedBytes, android.util.Base64.NO_WRAP)
+
+        android.util.Log.d("VoltAI", "Sending image to Vision: ${compressedBytes.size} bytes")
+
+        // 📍 FIXED: Target "gemini-vision" for photos
+        return callParseMeal("gemini-vision", mapOf(
+            "image" to base64Image
         ))
     }
 
-    private suspend fun callParseMeal(payload: Map<String, String>): MealLog {
-        android.util.Log.d("VoltVoice", "Sending to Aira: $payload")
-
+    private suspend fun callParseMeal(functionName: String, payload: Map<String, String>): MealLog {
         val payloadString = buildJsonObject {
             payload.forEach { (k, v) -> put(k, v) }
         }.toString()
 
-        val response = supabase.functions.invoke("parse-meal") {
-            contentType(ContentType.Application.Json)
-            setBody(payloadString)
+        val response = try {
+            supabase.functions.invoke(functionName) {
+                contentType(ContentType.Application.Json)
+                setBody(payloadString)
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("VoltAI", "Supabase $functionName Error", e)
+            if (e.message?.contains("503") == true) {
+                throw Exception("Aira is warming up. Please wait 10 seconds.")
+            }
+            throw e
         }
 
         val rawString = response.bodyAsText()
-        android.util.Log.d("VoltVoice", "Aira replied: $rawString")
 
-        // 2. CLEAN THE MARKDOWN
+        // Clean JSON from Markdown backticks
         val cleanJson = rawString
             .replace("```json", "", ignoreCase = true)
             .replace("```", "")
             .trim()
 
-        // 3. SAFETY CHECK: Did the server return an error instead of JSON?
         if (!cleanJson.startsWith("{")) {
-            android.util.Log.e("VoltVoice", "Invalid JSON from Aira: $cleanJson")
-            throw Exception("Aira was unable to parse that meal. Please try again with more detail.")
+            throw Exception("Aira could not identify that food. Try a clearer photo.")
         }
 
-        // 4. BULLETPROOF PARSING
         return try {
             val jsonObject = jsonParser.parseToJsonElement(cleanJson).jsonObject
 
@@ -67,18 +101,17 @@ object AiMealParser {
             }
 
             MealLog(
-                id = java.util.UUID.randomUUID().toString(),
-                user_id = "",
-                food_name = jsonObject["food_name"]?.jsonPrimitive?.contentOrNull ?: "Custom Meal",
+                id = UUID.randomUUID().toString(),
+                user_id = "", // Filled by Supabase on save
+                food_name = jsonObject["food_name"]?.jsonPrimitive?.contentOrNull ?: "Unknown Meal",
                 calories = getMacro("calories"),
                 protein = getMacro("protein"),
                 carbs = getMacro("carbs"),
                 fat = getMacro("fat"),
-                created_at = java.time.OffsetDateTime.now().toString()
+                created_at = OffsetDateTime.now().toString()
             )
-        } catch (e: Exception) {
-            android.util.Log.e("VoltVoice", "Parsing error", e)
-            throw Exception("Aira had trouble organizing that meal data. Please try again.")
+        } catch (_: Exception) {
+            throw Exception("Data error. Please try logging again.")
         }
     }
 }
